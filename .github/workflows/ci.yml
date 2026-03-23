@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: smm/backend
+
 jobs:
   backend-lint:
     name: Backend Lint
@@ -81,44 +85,48 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm run build
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 3
 
-  e2e-test:
-    name: E2E Tests
+  build-and-push:
+    name: Build & Push Docker Images
     runs-on: ubuntu-latest
-    needs: [backend-test, frontend-check]
-    defaults:
-      run:
-        working-directory: frontend
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [backend-lint, backend-test, frontend-check]
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - name: Start services with docker-compose
-        working-directory: .
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "image_tag=sha-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend image
+        working-directory: backend
         run: |
-          cp .env.example .env
-          docker compose up -d --build
-          # Wait for backend to be healthy
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8000/health && break
-            sleep 2
-          done
-      - run: npx playwright test
-        env:
-          BASE_URL: http://localhost:3000
-          BACKEND_URL: http://localhost:8000
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: playwright-report
-          path: frontend/playwright-report/
-          retention-days: 7
-      - name: Stop services
-        if: always()
-        working-directory: .
-        run: docker compose down -v
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          TAG="${{ steps.meta.outputs.image_tag }}"
+
+          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:latest"
+
+          echo "Pushed ${IMAGE}:${TAG}"
